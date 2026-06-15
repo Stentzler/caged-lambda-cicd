@@ -1,0 +1,113 @@
+name: Reusable Lambda Python ZIP Pipeline
+
+on:
+  workflow_call:
+    inputs:
+      function_name:
+        required: true
+        type: string
+
+      zip_path:
+        required: true
+        type: string
+
+      alias_name:
+        required: false
+        type: string
+        default: dev
+
+      environment_name:
+        required: false
+        type: string
+        default: dev
+
+      aws_region:
+        required: false
+        type: string
+        default: us-east-1
+
+      python_version:
+        required: false
+        type: string
+        default: "3.14"
+
+    secrets:
+      AWS_DEPLOY_ROLE_ARN:
+        required: true
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.environment_name }}
+    environment:
+      name: ${{ inputs.environment_name }}
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Run tests and lint
+        run: |
+          uv run pytest
+          uv run ruff check .
+          uv run ruff format --check .
+
+      - name: Package Lambda
+        run: make package
+
+      - name: Validate package artifact
+        run: test -f "${{ inputs.zip_path }}"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Deploy function code
+        run: |
+          aws lambda update-function-code \
+            --function-name "${{ inputs.function_name }}" \
+            --zip-file "fileb://${{ inputs.zip_path }}"
+          aws lambda wait function-updated-v2 \
+            --function-name "${{ inputs.function_name }}"
+
+      - name: Publish function version
+        id: publish
+        run: |
+          version=$(aws lambda publish-version \
+            --function-name "${{ inputs.function_name }}" \
+            --query Version \
+            --output text)
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Promote environment alias
+        run: |
+          aws lambda update-alias \
+            --function-name "${{ inputs.function_name }}" \
+            --name "${{ inputs.alias_name }}" \
+            --function-version "${{ steps.publish.outputs.version }}"
+
+      - name: Verify environment alias
+        run: |
+          aws lambda get-alias \
+            --function-name "${{ inputs.function_name }}" \
+            --name "${{ inputs.alias_name }}" \
+            --query '{Alias:Name,Version:FunctionVersion}'
